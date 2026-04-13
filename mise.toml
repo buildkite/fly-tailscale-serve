@@ -1,0 +1,23 @@
+[tools]
+go = "1.26.1"
+goreleaser = "2"
+golangci-lint = "2"
+
+[env]
+MISE_GITHUB_TOKEN = "{% if env.MISE_GITHUB_TOKEN is defined %}{{ env.MISE_GITHUB_TOKEN }}{% else %}{{ exec(command='gh auth token 2>/dev/null || true') }}{% endif %}"
+
+[tasks.build]
+description = "Build the CLI"
+run = "go build ./cmd/fly-tailscale-serve"
+
+[tasks.test]
+description = "Run tests"
+run = "go test ./..."
+
+[tasks.lint]
+description = "Run golangci-lint"
+run = "golangci-lint run ./..."
+
+[tasks.vet]
+description = "Run go vet"
+run = "go vet ./..."

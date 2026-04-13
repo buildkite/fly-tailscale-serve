@@ -1,0 +1,9 @@
+#!/bin/bash
+set -euo pipefail
+
+echo "--- :gear: Installing mise"
+curl -sSf https://mise.run | sh
+export PATH="$HOME/.local/bin:$PATH"
+
+echo "--- :package: Installing tools via mise"
+mise install
