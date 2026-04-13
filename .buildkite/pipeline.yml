@@ -1,22 +1,27 @@
 agents:
   queue: hosted
 
-env:
-  MISE_YES: "1"
-  MISE_TRUSTED_CONFIG_PATHS: /buildkite/builds
+secrets:
+  - MISE_GITHUB_TOKEN
 
 steps:
   - label: ":hammer: Build"
     key: build
     command: mise run build
+    plugins:
+      - mise#v1.1.1: ~
 
   - label: ":test_tube: Test"
     key: test
     command: mise run test
+    plugins:
+      - mise#v1.1.1: ~
 
   - label: ":lint-roller: Lint"
     key: lint
     command: mise run lint
+    plugins:
+      - mise#v1.1.1: ~
 
   - wait
 
@@ -25,6 +30,7 @@ steps:
     key: release
     command: ".buildkite/steps/release.sh"
     plugins:
+      - mise#v1.1.1: ~
       - aws-assume-role-with-web-identity#v1.4.0:
           role-arn: arn:aws:iam::445615400570:role/pipeline-buildkite-fly-tailscale-serve
           session-tags:
