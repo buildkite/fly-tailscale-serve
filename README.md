@@ -48,10 +48,10 @@ Download a binary from the [releases page](https://github.com/buildkite/fly-tail
 
 ### Fly Deployment
 
-Set the binary as the entrypoint in your `Dockerfile`:
+Set the binary as the entrypoint in your `Dockerfile`, passing the app command as a CLI argument:
 
 ```dockerfile
-ENTRYPOINT ["fly-tailscale-serve"]
+ENTRYPOINT ["fly-tailscale-serve", "--app-command", "node server.js"]
 ```
 
 Configure your `fly.toml` with no public `[http_service]`:
@@ -65,7 +65,6 @@ Configure your `fly.toml` with no public `[http_service]`:
   destination = "/data"
 
 [env]
-  APP_COMMAND = "node server.js"
   PORT = "8080"
   TAILSCALE_ADVERTISE_TAGS = "tag:my-service"
   TAILSCALE_SERVICE_NAME = "svc:my-service"
