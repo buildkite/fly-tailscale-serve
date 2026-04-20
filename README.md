@@ -1,18 +1,19 @@
 # fly-tailscale-serve
 
-Bootstrap [Tailscale Serve](https://tailscale.com/kb/1312/serve) for a localhost application running on a [Fly Machine](https://fly.io/docs/machines/).
+Publish a localhost application running on a [Fly Machine](https://fly.io/docs/machines/) into a Tailscale tailnet as a named [Tailscale Service](https://tailscale.com/kb/1552/tailscale-services), with no public internet exposure.
 
-`fly-tailscale-serve` is a process supervisor that handles the full lifecycle of publishing a Fly Machines app into a Tailscale tailnet as a named service, with no public internet exposure.
+`fly-tailscale-serve` is a process supervisor that handles the full lifecycle of publishing a Fly Machines app into a tailnet using [tsnet](https://tailscale.com/docs/features/tsnet) and an in-process reverse proxy.
 
 ## What it does
 
-1. Starts `tailscaled` in userspace mode inside a Fly Machine.
-2. Requests a Fly OIDC token from the local Fly API socket.
-3. Authenticates to Tailscale using workload identity federation.
-4. Starts your application on `127.0.0.1`.
-5. Publishes the app as a named Tailscale service via `tailscale serve`.
-6. Runs a watchdog that exits the process after repeated Tailscale health failures, letting Fly restart the machine cleanly.
-7. Shuts down gracefully: drains the named service, stops the app, resets Serve, disconnects from Tailscale, and stops `tailscaled`.
+1. Requests a Fly OIDC token from the local Fly API socket.
+2. Starts an embedded Tailscale node using `tsnet` with workload identity federation.
+3. Exposes the Tailscale LocalAPI via `tsnet.Loopback()` for downstream app use.
+4. Starts your application on `127.0.0.1`, passing `TS_LOCALAPI_ADDR` and `TS_LOCALAPI_CRED` env vars.
+5. Publishes the app as a named Tailscale service via `tsnet.ListenService`.
+6. Runs an in-process HTTPS reverse proxy that forwards traffic from the tailnet to your app.
+7. Runs a watchdog that exits the process after repeated Tailscale health failures, letting Fly restart the machine cleanly.
+8. Shuts down gracefully: drains the proxy, stops the app, and closes the tsnet server.
 
 ## Install
 
@@ -85,9 +86,9 @@ curl https://my-service.<your-tailnet>.ts.net/
 
 What to look for:
 
-- Fly logs should show `Starting tailscaled...`, successful Tailscale auth, app startup, and `Tailscale serve configured successfully`.
+- Fly logs should show tsnet startup, successful Tailscale auth, app startup, and `Reverse proxy configured`.
 - `tailscale debug resolve` should return service VIPs for the named service.
-- `curl` from a tailnet client should return your app's response with forwarded identity headers.
+- `curl` from a tailnet client should return your app's response.
 
 ## Environment Variables
 
@@ -108,23 +109,30 @@ What to look for:
 |---|---|---|
 | `TAILSCALE_ACCEPT_APP_CAPS` | | Comma-separated app capabilities to forward via `Tailscale-App-Capabilities` header |
 | `TAILSCALE_HOSTNAME` | `FLY_APP_NAME` or `FLY_APP_NAME-FLY_MACHINE_ID` | Tailscale hostname for the node |
-| `TAILSCALE_STATE_DIR` | `/data/tailscale` | `tailscaled` state directory |
-| `TAILSCALE_SOCKET` | `/var/run/tailscale/tailscaled.sock` | `tailscaled` local API socket path |
-| `TAILSCALED_PID_FILE` | `/var/run/tailscale/tailscaled.pid` | `tailscaled` PID file path |
-| `STARTUP_TIMEOUT` | `30s` | How long to wait for `tailscaled` and the app to become healthy |
-| `SHUTDOWN_GRACE` | `3s` | How long to wait after draining the service before stopping the app |
+| `TAILSCALE_STATE_DIR` | `/data/tailscale` | tsnet state directory |
+| `STARTUP_TIMEOUT` | `30s` | How long to wait for tsnet and the app to become healthy |
+| `SHUTDOWN_GRACE` | `3s` | How long to wait after stopping the proxy before stopping the app |
 | `WATCHDOG_INTERVAL` | `1m` | How often the watchdog checks Tailscale health |
 | `WATCHDOG_MAX_FAILURES` | `3` | Consecutive watchdog failures before the process exits |
 
+### Injected into the app process
+
+These env vars are set automatically on the app process and do not need to be configured:
+
+| Variable | Description |
+|---|---|
+| `TS_LOCALAPI_ADDR` | Loopback address (`host:port`) of the tsnet LocalAPI listener |
+| `TS_LOCALAPI_CRED` | Credential for authenticating to the LocalAPI (use as basic auth password with username `tsnet` and `Sec-Tailscale: localapi` header) |
+
 ## Startup Flow
 
-1. Start `tailscaled` in userspace mode.
-2. Wait for the daemon to be ready.
-3. Request a Fly OIDC token from `/.fly/api`.
-4. Run `tailscale up` with the federated identity client ID, the Fly token, the machine hostname, and the advertised tag.
-5. Wait for Tailscale to reach Running state.
-6. Start the configured app command on `http://127.0.0.1:${PORT}` and verify it responds.
-7. Publish `TAILSCALE_SERVICE_NAME` with Tailscale Serve.
+1. Request a Fly OIDC token from `/.fly/api`.
+2. Start an embedded Tailscale node using `tsnet` with the federated identity client ID, the Fly token, the machine hostname, and the advertised tags.
+3. Wait for the tsnet server to reach Running state.
+4. Start the LocalAPI loopback listener via `tsnet.Loopback()`.
+5. Start the configured app command on `http://127.0.0.1:${PORT}` with `TS_LOCALAPI_ADDR` and `TS_LOCALAPI_CRED` env vars, and verify it responds.
+6. Listen on the named Tailscale service via `tsnet.ListenService` with HTTPS on port 443.
+7. Run an in-process reverse proxy forwarding requests to the local app.
 8. Run a watchdog so repeated Tailscale health failures stop the process and let Fly restart the machine cleanly.
 
 ## Tailnet Prerequisites
@@ -200,7 +208,7 @@ To forward `Tailscale-App-Capabilities` headers, three things are needed:
 
 ### Named Service
 
-The named Tailscale service must be created in the [Tailscale admin UI](https://login.tailscale.com/admin/services) before deploying. `tailscale serve --service=...` requires the service object to exist.
+The named Tailscale service must be created in the [Tailscale admin UI](https://login.tailscale.com/admin/services) before deploying. `tsnet.ListenService` requires the service object to exist.
 
 ### Hostname vs Service Name
 
