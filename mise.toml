@@ -13,7 +13,7 @@ run = "go build ./cmd/fly-tailscale-serve"
 
 [tasks.test]
 description = "Run tests"
-run = "gotestsum ./..."
+run = "gotestsum --format testdox ./..."
 
 [tasks.lint]
 description = "Run golangci-lint"
