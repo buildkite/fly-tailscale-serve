@@ -8,11 +8,12 @@ Publish a localhost application running on a [Fly Machine](https://fly.io/docs/m
 
 1. Requests a Fly OIDC token from the local Fly API socket.
 2. Starts an embedded Tailscale node using `tsnet` with workload identity federation.
-3. Starts your application on `127.0.0.1`.
-4. Publishes the app as a named Tailscale service via `tsnet.ListenService`.
-5. Runs an in-process HTTPS reverse proxy that forwards traffic from the tailnet to your app.
-6. Runs a watchdog that exits the process after repeated Tailscale health failures, letting Fly restart the machine cleanly.
-7. Shuts down gracefully: drains the proxy, stops the app, and closes the tsnet server.
+3. Exposes the Tailscale LocalAPI via `tsnet.Loopback()` for downstream app use.
+4. Starts your application on `127.0.0.1`, passing `TS_LOCALAPI_ADDR` and `TS_LOCALAPI_CRED` env vars.
+5. Publishes the app as a named Tailscale service via `tsnet.ListenService`.
+6. Runs an in-process HTTPS reverse proxy that forwards traffic from the tailnet to your app.
+7. Runs a watchdog that exits the process after repeated Tailscale health failures, letting Fly restart the machine cleanly.
+8. Shuts down gracefully: drains the proxy, stops the app, and closes the tsnet server.
 
 ## Install
 
@@ -114,15 +115,25 @@ What to look for:
 | `WATCHDOG_INTERVAL` | `1m` | How often the watchdog checks Tailscale health |
 | `WATCHDOG_MAX_FAILURES` | `3` | Consecutive watchdog failures before the process exits |
 
+### Injected into the app process
+
+These env vars are set automatically on the app process and do not need to be configured:
+
+| Variable | Description |
+|---|---|
+| `TS_LOCALAPI_ADDR` | Loopback address (`host:port`) of the tsnet LocalAPI listener |
+| `TS_LOCALAPI_CRED` | Credential for authenticating to the LocalAPI (use as basic auth password with username `tsnet` and `Sec-Tailscale: localapi` header) |
+
 ## Startup Flow
 
 1. Request a Fly OIDC token from `/.fly/api`.
 2. Start an embedded Tailscale node using `tsnet` with the federated identity client ID, the Fly token, the machine hostname, and the advertised tags.
 3. Wait for the tsnet server to reach Running state.
-4. Start the configured app command on `http://127.0.0.1:${PORT}` and verify it responds.
-5. Listen on the named Tailscale service via `tsnet.ListenService` with HTTPS on port 443.
-6. Run an in-process reverse proxy forwarding requests to the local app.
-7. Run a watchdog so repeated Tailscale health failures stop the process and let Fly restart the machine cleanly.
+4. Start the LocalAPI loopback listener via `tsnet.Loopback()`.
+5. Start the configured app command on `http://127.0.0.1:${PORT}` with `TS_LOCALAPI_ADDR` and `TS_LOCALAPI_CRED` env vars, and verify it responds.
+6. Listen on the named Tailscale service via `tsnet.ListenService` with HTTPS on port 443.
+7. Run an in-process reverse proxy forwarding requests to the local app.
+8. Run a watchdog so repeated Tailscale health failures stop the process and let Fly restart the machine cleanly.
 
 ## Tailnet Prerequisites
 
