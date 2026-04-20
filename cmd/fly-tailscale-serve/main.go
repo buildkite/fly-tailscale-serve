@@ -75,8 +75,10 @@ type service struct {
 
 	app *processHandle
 
-	ts          *tsnet.Server
-	localClient *local.Client
+	ts           *tsnet.Server
+	localClient  *local.Client
+	loopbackAddr string
+	localAPICred string
 
 	listener    net.Listener
 	proxyServer *http.Server
@@ -359,7 +361,15 @@ func (s *service) startTailscale(ctx context.Context) error {
 
 	s.localClient = lc
 
+	loopbackAddr, _, localAPICred, err := s.ts.Loopback()
+	if err != nil {
+		return fmt.Errorf("start tsnet loopback: %w", err)
+	}
+	s.loopbackAddr = loopbackAddr
+	s.localAPICred = localAPICred
+
 	log.Printf("Tailscale up as %s, IPs=%v", st.Self.DNSName, st.TailscaleIPs)
+	log.Printf("LocalAPI available at %s", loopbackAddr)
 	return nil
 }
 
@@ -401,6 +411,10 @@ func (s *service) startApp() error {
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.Env = append(os.Environ(),
+		"TS_LOCALAPI_ADDR="+s.loopbackAddr,
+		"TS_LOCALAPI_CRED="+s.localAPICred,
+	)
 
 	handle, err := startProcess(cmd)
 	if err != nil {
@@ -476,6 +490,7 @@ func (s *service) startProxy(ctx context.Context) error {
 			pr.SetURL(target)
 			pr.Out.Host = pr.In.Host
 			pr.SetXForwarded()
+			pr.Out.Header.Set("X-Forwarded-Proto", "https")
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Printf("proxy error: %v", err)
