@@ -489,8 +489,15 @@ func (s *service) startProxy(ctx context.Context) error {
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(target)
 			pr.Out.Host = pr.In.Host
-			pr.SetXForwarded()
-			pr.Out.Header.Set("X-Forwarded-Proto", "https")
+
+			// Preserve forwarded headers from ServiceModeHTTP rather
+			// than overwriting them with SetXForwarded() which would
+			// use the internal pipe's loopback RemoteAddr.
+			for _, h := range []string{"X-Forwarded-For", "X-Forwarded-Proto"} {
+				if v := pr.In.Header.Get(h); v != "" {
+					pr.Out.Header.Set(h, v)
+				}
+			}
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Printf("proxy error: %v", err)
