@@ -390,7 +390,7 @@ func (s *service) requestIdentityToken(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("request Fly OIDC token: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -398,7 +398,7 @@ func (s *service) requestIdentityToken(ctx context.Context) (string, error) {
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("Fly OIDC request failed with %s: %s", resp.Status, strings.TrimSpace(string(responseBody)))
+		return "", fmt.Errorf("fly OIDC request failed with %s: %s", resp.Status, strings.TrimSpace(string(responseBody)))
 	}
 
 	return strings.TrimSpace(string(responseBody)), nil
@@ -437,7 +437,7 @@ func (s *service) waitForAppHealth(ctx context.Context, appDone <-chan error) er
 
 		resp, err := s.appHTTPClient.Do(req)
 		if err == nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if resp.StatusCode >= 200 && resp.StatusCode < 400 {
 				return nil
 			}
