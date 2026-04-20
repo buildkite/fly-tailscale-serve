@@ -10,10 +10,11 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +22,8 @@ import (
 	"time"
 
 	"github.com/alecthomas/kong"
+	"tailscale.com/client/local"
+	"tailscale.com/tsnet"
 )
 
 var version = "dev"
@@ -28,8 +31,6 @@ var version = "dev"
 const (
 	appHost            = "127.0.0.1"
 	flyAPISocket       = "/.fly/api"
-	serveRetryCount    = 5
-	serveRetryDelay    = 2 * time.Second
 	processStopTimeout = 10 * time.Second
 )
 
@@ -41,17 +42,15 @@ type cli struct {
 	Port       int    `env:"PORT" help:"Local application port on 127.0.0.1." required:"" group:"App"`
 
 	// Runtime
-	StartupTimeout      time.Duration `env:"STARTUP_TIMEOUT" help:"How long to wait for tailscaled and the application to become healthy." default:"30s" group:"Runtime"`
-	ShutdownGrace       time.Duration `env:"SHUTDOWN_GRACE" help:"How long to wait after draining the service before stopping the app." default:"3s" group:"Runtime"`
+	StartupTimeout      time.Duration `env:"STARTUP_TIMEOUT" help:"How long to wait for tsnet and the application to become healthy." default:"30s" group:"Runtime"`
+	ShutdownGrace       time.Duration `env:"SHUTDOWN_GRACE" help:"How long to wait after stopping the proxy before stopping the app." default:"3s" group:"Runtime"`
 	WatchdogInterval    time.Duration `env:"WATCHDOG_INTERVAL" help:"How often the watchdog should check Tailscale health." default:"1m" group:"Runtime"`
 	WatchdogMaxFailures int           `env:"WATCHDOG_MAX_FAILURES" help:"Consecutive watchdog failures before exiting." default:"3" group:"Runtime"`
 
 	// Tailscale
 	AdvertiseTags []string `env:"TAILSCALE_ADVERTISE_TAGS" help:"Comma-separated Tailscale tags to advertise." required:"" group:"Tailscale"`
-	ServiceName   string   `env:"TAILSCALE_SERVICE_NAME" help:"Named Tailscale service to publish." required:"" group:"Tailscale"`
-	StateDir      string   `env:"TAILSCALE_STATE_DIR" type:"path" help:"tailscaled state directory." default:"/data/tailscale" group:"Tailscale"`
-	SocketPath    string   `env:"TAILSCALE_SOCKET" type:"path" help:"tailscaled local API socket path." default:"/var/run/tailscale/tailscaled.sock" group:"Tailscale"`
-	PIDFile       string   `env:"TAILSCALED_PID_FILE" type:"path" help:"tailscaled PID file path." default:"/var/run/tailscale/tailscaled.pid" group:"Tailscale"`
+	ServiceName   string   `env:"TAILSCALE_SERVICE_NAME" help:"Named Tailscale service to publish (e.g. svc:my-service)." required:"" group:"Tailscale"`
+	StateDir      string   `env:"TAILSCALE_STATE_DIR" type:"path" help:"tsnet state directory." default:"/data/tailscale" group:"Tailscale"`
 	Hostname      string   `env:"TAILSCALE_HOSTNAME" help:"Tailscale hostname. Defaults to FLY_APP_NAME or FLY_APP_NAME-FLY_MACHINE_ID when running on Fly." group:"Tailscale"`
 	OIDCClientID  string   `env:"TAILSCALE_OIDC_CLIENT_ID" help:"Tailscale federated identity client ID." required:"" group:"Tailscale"`
 	OIDCAudience  string   `env:"TAILSCALE_OIDC_AUDIENCE" help:"Audience to request from Fly's OIDC token endpoint." required:"" group:"Tailscale"`
@@ -74,10 +73,14 @@ type service struct {
 	flyHTTPClient *http.Client
 	appHTTPClient *http.Client
 
-	serveReady bool
+	app *processHandle
 
-	app        *processHandle
-	tailscaled *processHandle
+	ts          *tsnet.Server
+	localClient *local.Client
+
+	listener    net.Listener
+	proxyServer *http.Server
+	proxyDone   chan error
 }
 
 type exitCodeError struct {
@@ -100,7 +103,7 @@ func main() {
 	kong.Parse(
 		&cli,
 		kong.Name("fly-tailscale-serve"),
-		kong.Description("Bootstrap Tailscale Serve for a localhost application running on a Fly Machine."),
+		kong.Description("Bootstrap a Tailscale service for a localhost application running on a Fly Machine."),
 		kong.UsageOnError(),
 		kong.Vars{"version": version},
 	)
@@ -129,17 +132,15 @@ func run(cli *cli) error {
 		return err
 	}
 
-	for _, dir := range []string{cli.StateDir, filepath.Dir(cli.SocketPath), filepath.Dir(cli.PIDFile)} {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return fmt.Errorf("create %s: %w", dir, err)
-		}
+	if err := os.MkdirAll(cli.StateDir, 0o755); err != nil {
+		return fmt.Errorf("create %s: %w", cli.StateDir, err)
 	}
 
 	svc := newService(cli)
 	defer svc.shutdown()
 	defer stop()
 
-	if err := svc.bootstrapTailscale(ctx); err != nil {
+	if err := svc.startTailscale(ctx); err != nil {
 		if errors.Is(err, context.Canceled) {
 			log.Println("Received shutdown signal, shutting down...")
 			return nil
@@ -166,7 +167,7 @@ func run(cli *cli) error {
 		return err
 	}
 
-	if err := svc.configureServe(ctx); err != nil {
+	if err := svc.startProxy(ctx); err != nil {
 		if errors.Is(err, context.Canceled) {
 			log.Println("Received shutdown signal, shutting down...")
 			return nil
@@ -184,6 +185,8 @@ func run(cli *cli) error {
 		return nil
 	case err := <-watchdogFatal:
 		return &exitCodeError{code: 1, err: err}
+	case err := <-svc.proxyDone:
+		return &exitCodeError{code: 1, err: fmt.Errorf("proxy server exited unexpectedly: %w", err)}
 	case err := <-appDone:
 		if err == nil {
 			return nil
@@ -241,6 +244,10 @@ func (c *cli) validate() error {
 	c.AdvertiseTags = normalizeTags(c.AdvertiseTags)
 	if len(c.AdvertiseTags) == 0 {
 		return errors.New("TAILSCALE_ADVERTISE_TAGS must contain at least one tag")
+	}
+
+	if !strings.HasPrefix(c.ServiceName, "svc:") {
+		return errors.New("TAILSCALE_SERVICE_NAME must start with \"svc:\"")
 	}
 
 	hostname, err := c.resolveHostname()
@@ -319,111 +326,41 @@ func ensureFlySocket() error {
 	return nil
 }
 
-func (s *service) bootstrapTailscale(ctx context.Context) error {
-	if err := s.startTailscaled(); err != nil {
-		return err
-	}
-
-	if err := s.waitForTailscaled(ctx); err != nil {
-		return err
-	}
-
-	if err := s.connectTailscale(ctx); err != nil {
-		return err
-	}
-
-	return s.waitForTailscaleConnection(ctx)
-}
-
-func (s *service) startTailscaled() error {
-	log.Println("Starting tailscaled...")
-
-	cmd := exec.Command(
-		"tailscaled",
-		"--tun=userspace-networking",
-		"--statedir="+s.cli.StateDir,
-		"--socket="+s.cli.SocketPath,
-	)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	handle, err := startProcess(cmd)
-	if err != nil {
-		return fmt.Errorf("start tailscaled: %w", err)
-	}
-
-	s.tailscaled = handle
-	if err := os.WriteFile(s.cli.PIDFile, []byte(strconv.Itoa(cmd.Process.Pid)), 0o644); err != nil {
-		_ = handle.Terminate(processStopTimeout)
-		s.tailscaled = nil
-		return fmt.Errorf("write tailscaled pid file: %w", err)
-	}
-
-	return nil
-}
-
-func (s *service) stopTailscaled() {
-	defer func() {
-		_ = os.Remove(s.cli.PIDFile)
-		s.tailscaled = nil
-	}()
-
-	if s.tailscaled == nil {
-		return
-	}
-
-	if err := s.tailscaled.Terminate(processStopTimeout); err != nil && !isExpectedShutdownError(err) {
-		log.Printf("tailscaled shutdown error: %v", err)
-	}
-}
-
-func (s *service) waitForTailscaled(ctx context.Context) error {
-	deadline := time.Now().Add(s.cli.StartupTimeout)
-	attempt := 1
-
-	for !time.Now().After(deadline) {
-		if _, err := s.runTailscaleCombined("version", "--daemon"); err == nil {
-			return nil
-		}
-
-		log.Printf("Waiting for tailscaled... (%d/%d)", attempt, int(s.cli.StartupTimeout/time.Second))
-		attempt++
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(time.Second):
-		}
-	}
-
-	return errors.New("tailscaled did not become ready in time")
-}
-
-func (s *service) connectTailscale(ctx context.Context) error {
+func (s *service) startTailscale(ctx context.Context) error {
 	log.Printf("Requesting Fly OIDC token for audience %s...", s.cli.OIDCAudience)
 	identityToken, err := s.requestIdentityToken(ctx)
 	if err != nil {
 		return err
 	}
 
-	log.Println("Authenticating to Tailscale with workload identity federation...")
-	output, err := s.runTailscaleCombined(
-		"up",
-		"--reset",
-		"--client-id="+s.cli.tailscaleClientID(),
-		"--id-token="+identityToken,
-		"--hostname="+s.cli.Hostname,
-		"--advertise-tags="+strings.Join(s.cli.AdvertiseTags, ","),
-	)
-	if err == nil {
-		return nil
+	log.Println("Starting tsnet server...")
+
+	s.ts = &tsnet.Server{
+		Dir:           s.cli.StateDir,
+		Hostname:      s.cli.Hostname,
+		AdvertiseTags: s.cli.AdvertiseTags,
+		ClientID:      s.cli.tailscaleClientID(),
+		IDToken:       identityToken,
+		UserLogf:      log.Printf,
 	}
 
-	if output != "" {
-		return fmt.Errorf("tailscale up failed: %s", output)
+	upCtx, cancel := context.WithTimeout(ctx, s.cli.StartupTimeout)
+	defer cancel()
+
+	st, err := s.ts.Up(upCtx)
+	if err != nil {
+		return fmt.Errorf("start tsnet: %w", err)
 	}
 
-	return fmt.Errorf("tailscale up failed: %w", err)
+	lc, err := s.ts.LocalClient()
+	if err != nil {
+		return fmt.Errorf("create tsnet local client: %w", err)
+	}
+
+	s.localClient = lc
+
+	log.Printf("Tailscale up as %s, IPs=%v", st.Self.DNSName, st.TailscaleIPs)
+	return nil
 }
 
 func (s *service) requestIdentityToken(ctx context.Context) (string, error) {
@@ -455,36 +392,6 @@ func (s *service) requestIdentityToken(ctx context.Context) (string, error) {
 	}
 
 	return strings.TrimSpace(string(responseBody)), nil
-}
-
-func (s *service) waitForTailscaleConnection(ctx context.Context) error {
-	log.Printf("Waiting for Tailscale to connect... (timeout: %s)", s.cli.StartupTimeout)
-
-	output, err := s.runTailscaleCombined("wait", "--timeout="+s.cli.StartupTimeout.String())
-	if err != nil {
-		if output != "" {
-			return fmt.Errorf("Tailscale did not become ready in time after authentication: %s", output)
-		}
-		return fmt.Errorf("Tailscale did not become ready in time after authentication: %w", err)
-	}
-
-	statusOutput, err := s.runTailscaleCombined("status")
-	if err != nil {
-		if statusOutput != "" {
-			return fmt.Errorf("check Tailscale status: %s", statusOutput)
-		}
-		return fmt.Errorf("check Tailscale status: %w", err)
-	}
-
-	if !strings.Contains(statusOutput, s.cli.Hostname) {
-		return fmt.Errorf("Tailscale did not connect as %s", s.cli.Hostname)
-	}
-
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	return nil
 }
 
 func (s *service) startApp() error {
@@ -541,38 +448,57 @@ func (s *service) waitForAppHealth(ctx context.Context, appDone <-chan error) er
 	return fmt.Errorf("app did not become reachable at %s", s.cli.appURL())
 }
 
-func (s *service) configureServe(ctx context.Context) error {
-	_, _ = s.runTailscaleCombined("serve", "reset")
-	s.serveReady = false
-
-	for attempt := 1; attempt <= serveRetryCount; attempt++ {
-		serveArgs := []string{
-			"serve",
-			"--bg",
-			"--service=" + s.cli.ServiceName,
-			"--https=443",
-		}
-		if len(s.cli.AcceptAppCaps) > 0 {
-			serveArgs = append(serveArgs, "--accept-app-caps="+strings.Join(s.cli.AcceptAppCaps, ","))
-		}
-		serveArgs = append(serveArgs, s.cli.appURL())
-
-		log.Printf("Configuring serve with args: %v", serveArgs)
-		if _, err := s.runTailscaleCombined(serveArgs...); err == nil {
-			log.Println("Tailscale serve configured successfully")
-			s.serveReady = true
-			return nil
-		}
-
-		log.Printf("Tailscale serve failed, retrying... (%d/%d)", attempt, serveRetryCount)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(serveRetryDelay):
+func (s *service) startProxy(ctx context.Context) error {
+	mode := tsnet.ServiceModeHTTP{
+		HTTPS: true,
+		Port:  443,
+	}
+	if len(s.cli.AcceptAppCaps) > 0 {
+		mode.AcceptAppCaps = map[string][]string{
+			"/": s.cli.AcceptAppCaps,
 		}
 	}
 
-	return fmt.Errorf("Tailscale serve was not configured for %s", s.cli.ServiceName)
+	log.Printf("Listening on Tailscale service %s...", s.cli.ServiceName)
+	ln, err := s.ts.ListenService(s.cli.ServiceName, mode)
+	if err != nil {
+		return fmt.Errorf("listen on Tailscale service %s: %w", s.cli.ServiceName, err)
+	}
+	s.listener = ln
+
+	target := &url.URL{
+		Scheme: "http",
+		Host:   net.JoinHostPort(appHost, strconv.Itoa(s.cli.Port)),
+	}
+
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(target)
+			pr.Out.Host = pr.In.Host
+			pr.SetXForwarded()
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Printf("proxy error: %v", err)
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+		},
+	}
+
+	s.proxyServer = &http.Server{
+		Handler:           proxy,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	s.proxyDone = make(chan error, 1)
+
+	go func() {
+		err := s.proxyServer.Serve(ln)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			s.proxyDone <- err
+		}
+		close(s.proxyDone)
+	}()
+
+	log.Printf("Reverse proxy configured for %s → %s", s.cli.ServiceName, s.cli.appURL())
+	return nil
 }
 
 func (s *service) watchdog(ctx context.Context, fatal chan<- error) {
@@ -588,42 +514,51 @@ func (s *service) watchdog(ctx context.Context, fatal chan<- error) {
 		case <-ticker.C:
 		}
 
-		output, err := s.runTailscaleCombined("status")
-		if err == nil {
-			failures = 0
+		if err := s.tailscaleHealthy(ctx); err != nil {
+			failures++
+			log.Printf("watchdog: tailscale health check failed (%d/%d): %v", failures, s.cli.WatchdogMaxFailures, err)
+
+			if failures >= s.cli.WatchdogMaxFailures {
+				fatalErr := fmt.Errorf("watchdog: tailscale became unhealthy after %d consecutive failures: %v", s.cli.WatchdogMaxFailures, err)
+				select {
+				case fatal <- fatalErr:
+				case <-ctx.Done():
+				}
+				return
+			}
+
 			continue
 		}
 
-		failures++
-		if output != "" {
-			log.Printf("watchdog: tailscale status failed (%d/%d): %s", failures, s.cli.WatchdogMaxFailures, output)
-		} else {
-			log.Printf("watchdog: tailscale status failed (%d/%d): %v", failures, s.cli.WatchdogMaxFailures, err)
-		}
-
-		if failures < s.cli.WatchdogMaxFailures {
-			continue
-		}
-
-		failureDetail := err.Error()
-		if output != "" {
-			failureDetail = output
-		}
-
-		fatalErr := fmt.Errorf("watchdog: tailscale became unhealthy after %d consecutive failures: %s", s.cli.WatchdogMaxFailures, failureDetail)
-		select {
-		case fatal <- fatalErr:
-		case <-ctx.Done():
-		}
-		return
+		failures = 0
 	}
 }
 
+func (s *service) tailscaleHealthy(ctx context.Context) error {
+	st, err := s.localClient.StatusWithoutPeers(ctx)
+	if err != nil {
+		return err
+	}
+	if st == nil || st.Self == nil {
+		return errors.New("missing tsnet self status")
+	}
+	if st.BackendState != "Running" {
+		return fmt.Errorf("backend state = %s", st.BackendState)
+	}
+	if len(st.TailscaleIPs) == 0 {
+		return errors.New("no tailscale IPs assigned")
+	}
+	return nil
+}
+
 func (s *service) shutdown() {
-	if s.serveReady {
-		log.Printf("Draining Tailscale service %s...", s.cli.ServiceName)
-		_, _ = s.runTailscaleCombined("serve", "drain", s.cli.ServiceName)
-		time.Sleep(s.cli.ShutdownGrace)
+	if s.proxyServer != nil {
+		log.Println("Shutting down proxy server...")
+		ctx, cancel := context.WithTimeout(context.Background(), s.cli.ShutdownGrace)
+		if err := s.proxyServer.Shutdown(ctx); err != nil {
+			log.Printf("proxy shutdown error: %v", err)
+		}
+		cancel()
 	}
 
 	if s.app != nil {
@@ -633,21 +568,18 @@ func (s *service) shutdown() {
 		s.app = nil
 	}
 
-	_, _ = s.runTailscaleCombined("serve", "reset")
-	_, _ = s.runTailscaleCombined("down")
-	s.stopTailscaled()
-}
+	if s.listener != nil {
+		_ = s.listener.Close()
+		s.listener = nil
+	}
 
-func (s *service) runTailscaleCombined(args ...string) (string, error) {
-	allArgs := append([]string{"--socket=" + s.cli.SocketPath}, args...)
-	cmd := exec.Command("tailscale", allArgs...)
-
-	var buffer bytes.Buffer
-	cmd.Stdout = &buffer
-	cmd.Stderr = &buffer
-
-	err := cmd.Run()
-	return strings.TrimSpace(buffer.String()), err
+	if s.ts != nil {
+		log.Println("Closing tsnet server...")
+		if err := s.ts.Close(); err != nil {
+			log.Printf("tsnet close error: %v", err)
+		}
+		s.ts = nil
+	}
 }
 
 func startProcess(cmd *exec.Cmd) (*processHandle, error) {
