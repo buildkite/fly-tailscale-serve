@@ -96,6 +96,27 @@ func TestLitestreamStartupWithFakeProcess(t *testing.T) {
 		}
 	})
 
+	t.Run("socket path never removes a database", func(t *testing.T) {
+		c := litestreamCLI(t)
+		c.LitestreamSocket = c.LitestreamDB
+		if err := os.WriteFile(c.LitestreamDB, []byte("sqlite"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c.LitestreamBinary = writeFakeLitestream(t, filepath.Join(t.TempDir(), "calls"))
+		s := newService(&c)
+		if err := s.startLitestream(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		defer s.shutdown()
+		got, err := os.ReadFile(c.LitestreamDB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != "sqlite" {
+			t.Fatalf("database contents = %q, want sqlite", got)
+		}
+	})
+
 	t.Run("restore failure", func(t *testing.T) {
 		c := litestreamCLI(t)
 		c.LitestreamBinary = writeScript(t, "exit 23")

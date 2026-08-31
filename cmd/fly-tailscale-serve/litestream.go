@@ -95,7 +95,6 @@ func (s *service) startLitestream(ctx context.Context) error {
 		}
 		s.litestreamFreshDB = true
 	}
-	_ = os.Remove(s.cli.LitestreamSocket)
 
 	cmd := s.litestreamCommand("replicate", "-config", s.cli.LitestreamConfig)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
