@@ -55,9 +55,12 @@ func (c *cli) validateLitestream() error {
 			return errors.New("LITESTREAM_AWS_WEB_IDENTITY_TOKEN_FILE must be an absolute path")
 		}
 		tokenPath := filepath.Clean(c.LitestreamAWSTokenFile)
+		dbPath := filepath.Clean(c.LitestreamDB)
+		if tokenPath == dbPath || strings.HasPrefix(tokenPath, dbPath+"-") {
+			return errors.New("LITESTREAM_AWS_WEB_IDENTITY_TOKEN_FILE must not equal LITESTREAM_DB or one of its sidecar paths")
+		}
 		for name, path := range map[string]string{
 			"LITESTREAM_CONFIG": c.LitestreamConfig,
-			"LITESTREAM_DB":     c.LitestreamDB,
 			"LITESTREAM_SOCKET": c.LitestreamSocket,
 		} {
 			if tokenPath == filepath.Clean(path) {

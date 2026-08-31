@@ -66,6 +66,16 @@ func TestValidateLitestream(t *testing.T) {
 			})
 		}
 	})
+	t.Run("OIDC token file cannot replace database sidecars", func(t *testing.T) {
+		for _, suffix := range []string{"-wal", "-shm", "-journal", "-txid", "-litestream"} {
+			t.Run(suffix, func(t *testing.T) {
+				c := litestreamCLI(t)
+				c.LitestreamAWSRoleARN = "arn:aws:iam::123:role/test"
+				c.LitestreamAWSTokenFile = c.LitestreamDB + suffix
+				assertValidateError(t, c, "sidecar paths")
+			})
+		}
+	})
 }
 
 func TestLitestreamStartupWithFakeProcess(t *testing.T) {
