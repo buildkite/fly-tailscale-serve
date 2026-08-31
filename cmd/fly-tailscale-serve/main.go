@@ -47,6 +47,19 @@ type cli struct {
 	WatchdogInterval    time.Duration `env:"WATCHDOG_INTERVAL" help:"How often the watchdog should check Tailscale health." default:"1m" group:"Runtime"`
 	WatchdogMaxFailures int           `env:"WATCHDOG_MAX_FAILURES" help:"Consecutive watchdog failures before exiting." default:"3" group:"Runtime"`
 
+	// Litestream
+	LitestreamConfig          string        `env:"LITESTREAM_CONFIG" type:"path" help:"Enable Litestream supervision with this YAML config." group:"Litestream"`
+	LitestreamDB              string        `env:"LITESTREAM_DB" type:"path" help:"Exact SQLite database path configured in Litestream." group:"Litestream"`
+	LitestreamSocket          string        `env:"LITESTREAM_SOCKET" type:"path" help:"Unix control socket configured in Litestream YAML." group:"Litestream"`
+	LitestreamBinary          string        `env:"LITESTREAM_BINARY" help:"Litestream executable path." default:"litestream" group:"Litestream"`
+	LitestreamStartupTimeout  time.Duration `env:"LITESTREAM_STARTUP_TIMEOUT" help:"Budget for restore, daemon readiness, and initial sync." default:"30s" group:"Litestream"`
+	LitestreamShutdownTimeout time.Duration `env:"LITESTREAM_SHUTDOWN_TIMEOUT" help:"Total budget for proxy drain, app shutdown, final sync, and Litestream shutdown." default:"15s" group:"Litestream"`
+	LitestreamAWSRoleARN      string        `env:"LITESTREAM_AWS_ROLE_ARN" help:"AWS IAM role exposed to Litestream through web identity." group:"Litestream AWS OIDC"`
+	LitestreamAWSSessionName  string        `env:"LITESTREAM_AWS_ROLE_SESSION_NAME" help:"Optional AWS role session name." group:"Litestream AWS OIDC"`
+	LitestreamAWSAudience     string        `env:"LITESTREAM_AWS_OIDC_AUDIENCE" help:"Fly OIDC audience for AWS STS." default:"sts.amazonaws.com" group:"Litestream AWS OIDC"`
+	LitestreamAWSTokenFile    string        `env:"LITESTREAM_AWS_WEB_IDENTITY_TOKEN_FILE" type:"path" help:"Private, atomically refreshed web identity token file." default:"/run/fly-tailscale-serve/aws-web-identity-token" group:"Litestream AWS OIDC"`
+	LitestreamAWSRefresh      time.Duration `env:"LITESTREAM_AWS_OIDC_REFRESH_BEFORE" help:"Refresh the Fly OIDC token this long before expiry." default:"2m" group:"Litestream AWS OIDC"`
+
 	// Tailscale
 	AdvertiseTags []string `env:"TAILSCALE_ADVERTISE_TAGS" help:"Comma-separated Tailscale tags to advertise." required:"" group:"Tailscale"`
 	ServiceName   string   `env:"TAILSCALE_SERVICE_NAME" help:"Named Tailscale service to publish (e.g. svc:my-service)." required:"" group:"Tailscale"`
@@ -73,7 +86,12 @@ type service struct {
 	flyHTTPClient *http.Client
 	appHTTPClient *http.Client
 
-	app *processHandle
+	app               *processHandle
+	litestream        *processHandle
+	litestreamDone    chan error
+	litestreamEnv     []string
+	litestreamFreshDB bool
+	oidc              *oidcTokenManager
 
 	ts           *tsnet.Server
 	localClient  *local.Client
@@ -151,6 +169,12 @@ func run(cli *cli) error {
 		return err
 	}
 
+	if cli.litestreamEnabled() {
+		if err := svc.startLitestream(ctx); err != nil {
+			return err
+		}
+	}
+
 	if err := svc.startApp(); err != nil {
 		return err
 	}
@@ -169,6 +193,15 @@ func run(cli *cli) error {
 		return err
 	}
 
+	if cli.litestreamEnabled() && svc.litestreamFreshDB {
+		syncCtx, cancel := context.WithTimeout(ctx, cli.LitestreamStartupTimeout)
+		err := svc.syncLitestream(syncCtx)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("establish initial Litestream sync: %w", err)
+		}
+	}
+
 	if err := svc.startProxy(ctx); err != nil {
 		if errors.Is(err, context.Canceled) {
 			log.Println("Received shutdown signal, shutting down...")
@@ -181,13 +214,17 @@ func run(cli *cli) error {
 	watchdogFatal := make(chan error, 1)
 	go svc.watchdog(ctx, watchdogFatal)
 
+	return waitForTermination(ctx, watchdogFatal, svc.proxyDone, appDone, svc.litestreamDone, svc.oidcErrors())
+}
+
+func waitForTermination(ctx context.Context, watchdogFatal, proxyDone, appDone, litestreamDone, oidcErrors <-chan error) error {
 	select {
 	case <-ctx.Done():
 		log.Println("Received shutdown signal, shutting down...")
 		return nil
 	case err := <-watchdogFatal:
 		return &exitCodeError{code: 1, err: err}
-	case err := <-svc.proxyDone:
+	case err := <-proxyDone:
 		return &exitCodeError{code: 1, err: fmt.Errorf("proxy server exited unexpectedly: %w", err)}
 	case err := <-appDone:
 		if err == nil {
@@ -195,6 +232,13 @@ func run(cli *cli) error {
 		}
 
 		return &exitCodeError{code: exitCode(err), err: fmt.Errorf("app process exited: %w", err)}
+	case err := <-litestreamDone:
+		if err == nil {
+			err = errors.New("process exited successfully")
+		}
+		return &exitCodeError{code: 1, err: fmt.Errorf("litestream exited unexpectedly: %w", err)}
+	case err := <-oidcErrors:
+		return &exitCodeError{code: 1, err: fmt.Errorf("litestream AWS identity refresh failed: %w", err)}
 	}
 }
 
@@ -233,6 +277,9 @@ func (c *cli) validate() error {
 
 	if c.ShutdownGrace <= 0 {
 		return fmt.Errorf("SHUTDOWN_GRACE must be greater than 0")
+	}
+	if err := c.validateLitestream(); err != nil {
+		return err
 	}
 
 	if c.WatchdogInterval <= 0 {
@@ -374,7 +421,11 @@ func (s *service) startTailscale(ctx context.Context) error {
 }
 
 func (s *service) requestIdentityToken(ctx context.Context) (string, error) {
-	payload := map[string]string{"aud": s.cli.OIDCAudience}
+	return s.requestIdentityTokenForAudience(ctx, s.cli.OIDCAudience)
+}
+
+func (s *service) requestIdentityTokenForAudience(ctx context.Context, audience string) (string, error) {
+	payload := map[string]string{"aud": audience}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", fmt.Errorf("marshal Fly OIDC request: %w", err)
@@ -455,6 +506,13 @@ func (s *service) waitForAppHealth(ctx context.Context, appDone <-chan error) er
 			return fmt.Errorf("app process exited before becoming reachable at %s: %w", s.cli.appURL(), err)
 		case <-ctx.Done():
 			return ctx.Err()
+		case err := <-s.litestreamDone:
+			if err == nil {
+				err = errors.New("process exited successfully")
+			}
+			return fmt.Errorf("litestream exited while waiting for app health: %w", err)
+		case err := <-s.oidcErrors():
+			return fmt.Errorf("litestream AWS identity refresh failed: %w", err)
 		case <-time.After(time.Second):
 		}
 	}
@@ -574,9 +632,15 @@ func (s *service) tailscaleHealthy(ctx context.Context) error {
 }
 
 func (s *service) shutdown() {
+	litestreamMode := s.cli.litestreamEnabled()
+	deadline := time.Now().Add(s.cli.LitestreamShutdownTimeout)
 	if s.proxyServer != nil {
 		log.Println("Shutting down proxy server...")
-		ctx, cancel := context.WithTimeout(context.Background(), s.cli.ShutdownGrace)
+		proxyTimeout := s.cli.ShutdownGrace
+		if litestreamMode {
+			proxyTimeout = minDuration(proxyTimeout, time.Until(deadline))
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), proxyTimeout)
 		if err := s.proxyServer.Shutdown(ctx); err != nil {
 			log.Printf("proxy shutdown error: %v", err)
 		}
@@ -584,10 +648,33 @@ func (s *service) shutdown() {
 	}
 
 	if s.app != nil {
-		if err := s.app.Terminate(processStopTimeout); err != nil && !isExpectedShutdownError(err) {
+		appTimeout := processStopTimeout
+		if litestreamMode {
+			appTimeout = remaining(deadline)
+		}
+		if err := s.app.Terminate(appTimeout); err != nil && !isExpectedShutdownError(err) {
 			log.Printf("app shutdown error: %v", err)
 		}
 		s.app = nil
+	}
+
+	if s.litestream != nil {
+		if time.Until(deadline) > 0 {
+			ctx, cancel := context.WithTimeout(context.Background(), remaining(deadline))
+			if err := s.syncLitestream(ctx); err != nil {
+				log.Printf("final Litestream sync error: %v", err)
+			}
+			cancel()
+		}
+		if err := s.litestream.Terminate(remaining(deadline)); err != nil && !isExpectedShutdownError(err) {
+			log.Printf("Litestream shutdown error: %v", err)
+		}
+		s.litestream = nil
+	}
+
+	if s.oidc != nil {
+		s.oidc.Close()
+		s.oidc = nil
 	}
 
 	if s.listener != nil {
@@ -602,6 +689,20 @@ func (s *service) shutdown() {
 		}
 		s.ts = nil
 	}
+}
+
+func remaining(deadline time.Time) time.Duration {
+	if d := time.Until(deadline); d > 0 {
+		return d
+	}
+	return time.Nanosecond
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func startProcess(cmd *exec.Cmd) (*processHandle, error) {

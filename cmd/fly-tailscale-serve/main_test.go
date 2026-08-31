@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,17 +13,23 @@ import (
 
 func validCLI() cli {
 	return cli{
-		AppCommand:          "echo hello",
-		Port:                8080,
-		StartupTimeout:      30 * time.Second,
-		ShutdownGrace:       3 * time.Second,
-		WatchdogInterval:    1 * time.Minute,
-		WatchdogMaxFailures: 3,
-		AdvertiseTags:       []string{"tag:test"},
-		ServiceName:         "svc:my-service",
-		OIDCClientID:        "client-id",
-		OIDCAudience:        "tailscale.com",
-		Hostname:            "test-host",
+		AppCommand:                "echo hello",
+		Port:                      8080,
+		StartupTimeout:            30 * time.Second,
+		ShutdownGrace:             3 * time.Second,
+		WatchdogInterval:          1 * time.Minute,
+		WatchdogMaxFailures:       3,
+		AdvertiseTags:             []string{"tag:test"},
+		ServiceName:               "svc:my-service",
+		OIDCClientID:              "client-id",
+		OIDCAudience:              "tailscale.com",
+		Hostname:                  "test-host",
+		LitestreamBinary:          "litestream",
+		LitestreamStartupTimeout:  30 * time.Second,
+		LitestreamShutdownTimeout: 15 * time.Second,
+		LitestreamAWSAudience:     "sts.amazonaws.com",
+		LitestreamAWSTokenFile:    "/run/fly-tailscale-serve/aws-web-identity-token",
+		LitestreamAWSRefresh:      2 * time.Minute,
 	}
 }
 
@@ -323,6 +330,26 @@ func TestProcessHandleTerminateNil(t *testing.T) {
 	if err := p.Terminate(time.Second); err != nil {
 		t.Errorf("Terminate on nil handle should return nil, got %v", err)
 	}
+}
+
+func TestWaitForAppHealthFailures(t *testing.T) {
+	t.Run("app exits early", func(t *testing.T) {
+		c := validCLI()
+		c.StartupTimeout = time.Second
+		s := newService(&c)
+		done := make(chan error, 1)
+		done <- io.EOF
+		err := s.waitForAppHealth(context.Background(), done)
+		assertErrorContains(t, err, "app process exited before becoming reachable")
+	})
+
+	t.Run("health deadline", func(t *testing.T) {
+		c := validCLI()
+		c.StartupTimeout = time.Millisecond
+		s := newService(&c)
+		err := s.waitForAppHealth(context.Background(), make(chan error))
+		assertErrorContains(t, err, "app did not become reachable")
+	})
 }
 
 // test helpers
