@@ -139,7 +139,7 @@ With supervision enabled, PID 1 owns both child processes and does the following
 3. Starts the app. On a fresh database, it waits for app health and then forces `sync -wait` before exposing the Tailscale proxy.
 4. Stops the app if Litestream exits or AWS workload identity can no longer be refreshed. This prevents unprotected writes.
 5. If the app exits first, preserves its exit status while stopping Litestream.
-6. On a signal, drains the proxy, stops and waits for the app so SQLite closes, forces a final sync, and then stops Litestream. All phases share `LITESTREAM_SHUTDOWN_TIMEOUT`; expired phases are killed cleanly.
+6. On a signal, drains the proxy, stops and waits for the app so SQLite closes, forces a final sync, and then stops Litestream. All phases share `LITESTREAM_SHUTDOWN_TIMEOUT`; after proxy drain, each phase receives at most half the remaining time so an uncooperative app or sync cannot consume the next phase's budget. Expired phases are killed cleanly.
 
 Control-socket commands are used instead of log parsing. Litestream configuration remains the source of truth for replicas, retention, encryption, and provider settings.
 

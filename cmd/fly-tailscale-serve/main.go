@@ -661,7 +661,9 @@ func (s *service) shutdown() {
 	if s.app != nil {
 		appTimeout := processStopTimeout
 		if litestreamMode {
-			appTimeout = remaining(deadline)
+			// Reserve half of the remaining budget for Litestream's
+			// explicit sync and process shutdown phases.
+			appTimeout = halfRemaining(deadline)
 		}
 		if err := s.app.Terminate(appTimeout); err != nil && !isExpectedShutdownError(err) {
 			log.Printf("app shutdown error: %v", err)
@@ -671,7 +673,9 @@ func (s *service) shutdown() {
 
 	if s.litestream != nil {
 		if time.Until(deadline) > 0 {
-			ctx, cancel := context.WithTimeout(context.Background(), remaining(deadline))
+			// Reserve half of the remaining budget for signaling and
+			// waiting for Litestream's own graceful final sync.
+			ctx, cancel := context.WithTimeout(context.Background(), halfRemaining(deadline))
 			if err := s.syncLitestream(ctx); err != nil {
 				log.Printf("final Litestream sync error: %v", err)
 			}
@@ -704,6 +708,14 @@ func (s *service) shutdown() {
 
 func remaining(deadline time.Time) time.Duration {
 	if d := time.Until(deadline); d > 0 {
+		return d
+	}
+	return time.Nanosecond
+}
+
+func halfRemaining(deadline time.Time) time.Duration {
+	d := remaining(deadline) / 2
+	if d > 0 {
 		return d
 	}
 	return time.Nanosecond

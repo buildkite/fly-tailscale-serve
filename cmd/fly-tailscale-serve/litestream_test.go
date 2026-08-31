@@ -217,6 +217,37 @@ func TestShutdownOrdersAppSyncAndLitestream(t *testing.T) {
 	}
 }
 
+func TestShutdownReservesSyncTimeAfterAppEscalation(t *testing.T) {
+	c := litestreamCLI(t)
+	c.LitestreamShutdownTimeout = 400 * time.Millisecond
+	logPath := filepath.Join(t.TempDir(), "calls")
+	c.LitestreamBinary = writeFakeLitestream(t, logPath)
+	s := newService(&c)
+	var err error
+	s.litestream, err = startProcess(s.litestreamCommand("replicate"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	appScript := writeScript(t, `trap 'echo app-term >> "$EVENT_LOG"; trap "" TERM' TERM; while :; do :; done`)
+	appCmd := exec.Command(appScript)
+	appCmd.Env = append(os.Environ(), "EVENT_LOG="+logPath)
+	s.app, err = startProcess(appCmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(25 * time.Millisecond)
+	started := time.Now()
+	s.shutdown()
+	if time.Since(started) > time.Second {
+		t.Fatal("shutdown exceeded total budget")
+	}
+	calls := readCalls(t, logPath)
+	appAt, syncAt := strings.Index(calls, "app-term"), strings.Index(calls, "sync ")
+	if appAt < 0 || syncAt <= appAt {
+		t.Fatalf("final sync did not follow app escalation:\n%s", calls)
+	}
+}
+
 func TestProcessTerminateRacesWaitAndEscalates(t *testing.T) {
 	cmd := exec.Command(writeScript(t, `trap '' TERM; while :; do sleep 1; done`))
 	p, err := startProcess(cmd)
