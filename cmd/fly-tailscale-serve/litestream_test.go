@@ -140,6 +140,22 @@ func TestLitestreamStartupWithFakeProcess(t *testing.T) {
 		}
 	})
 
+	t.Run("signal during restore", func(t *testing.T) {
+		c := litestreamCLI(t)
+		c.LitestreamBinary = writeScript(t, "exec sleep 5")
+		s := newService(&c)
+		ctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(50*time.Millisecond, cancel)
+		started := time.Now()
+		err := s.startLitestream(ctx)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want context cancellation", err)
+		}
+		if time.Since(started) > time.Second {
+			t.Fatal("restore cancellation was not prompt")
+		}
+	})
+
 	t.Run("initial sync failure", func(t *testing.T) {
 		c := litestreamCLI(t)
 		if err := os.WriteFile(c.LitestreamDB, []byte("sqlite"), 0o600); err != nil {
@@ -249,6 +265,18 @@ func TestWaitForTermination(t *testing.T) {
 			t.Fatalf("error = %v", err)
 		}
 	})
+}
+
+func TestContextCommandError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := contextCommandError(ctx, errors.New("signal: killed")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context cancellation", err)
+	}
+	want := errors.New("command failed")
+	if got := contextCommandError(context.Background(), want); got != want {
+		t.Fatalf("error = %v, want %v", got, want)
+	}
 }
 
 func exitedProcessState(t *testing.T, code int) *os.ProcessState {

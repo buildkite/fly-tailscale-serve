@@ -171,6 +171,10 @@ func run(cli *cli) error {
 
 	if cli.litestreamEnabled() {
 		if err := svc.startLitestream(ctx); err != nil {
+			if errors.Is(err, context.Canceled) {
+				log.Println("Received shutdown signal, shutting down...")
+				return nil
+			}
 			return err
 		}
 	}
@@ -196,8 +200,15 @@ func run(cli *cli) error {
 	if cli.litestreamEnabled() && svc.litestreamFreshDB {
 		syncCtx, cancel := context.WithTimeout(ctx, cli.LitestreamStartupTimeout)
 		err := svc.syncLitestream(syncCtx)
+		if err != nil {
+			err = contextCommandError(syncCtx, err)
+		}
 		cancel()
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				log.Println("Received shutdown signal, shutting down...")
+				return nil
+			}
 			return fmt.Errorf("establish initial Litestream sync: %w", err)
 		}
 	}

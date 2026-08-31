@@ -87,7 +87,7 @@ func (s *service) startLitestream(ctx context.Context) error {
 	log.Printf("Restoring %s from Litestream if needed...", s.cli.LitestreamDB)
 	if err := s.runLitestreamCommand(startupCtx, "restore", "-config", s.cli.LitestreamConfig,
 		"-if-db-not-exists", "-if-replica-exists", s.cli.LitestreamDB); err != nil {
-		return fmt.Errorf("litestream restore: %w", err)
+		return fmt.Errorf("litestream restore: %w", contextCommandError(startupCtx, err))
 	}
 	if _, err := os.Stat(s.cli.LitestreamDB); err != nil {
 		if !os.IsNotExist(err) {
@@ -113,13 +113,16 @@ func (s *service) startLitestream(ctx context.Context) error {
 		if err == nil {
 			if !s.litestreamFreshDB {
 				if err := s.syncLitestream(startupCtx); err != nil {
-					return fmt.Errorf("initial Litestream sync: %w", err)
+					return fmt.Errorf("initial Litestream sync: %w", contextCommandError(startupCtx, err))
 				}
 			}
 			return nil
 		}
 		select {
 		case err := <-s.litestreamDone:
+			if startupCtx.Err() != nil {
+				return startupCtx.Err()
+			}
 			if err == nil {
 				err = errors.New("process exited successfully")
 			}
@@ -131,6 +134,13 @@ func (s *service) startLitestream(ctx context.Context) error {
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
+}
+
+func contextCommandError(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
 }
 
 func (s *service) syncLitestream(ctx context.Context) error {
