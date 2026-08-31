@@ -49,6 +49,23 @@ func TestValidateLitestream(t *testing.T) {
 		c.LitestreamAWSRoleARN = "arn:aws:iam::123:role/test"
 		assertValidateError(t, c, "require LITESTREAM_CONFIG")
 	})
+	t.Run("OIDC token file cannot replace supervised files", func(t *testing.T) {
+		for _, target := range []struct {
+			name string
+			path func(cli) string
+		}{
+			{name: "config", path: func(c cli) string { return c.LitestreamConfig }},
+			{name: "database", path: func(c cli) string { return c.LitestreamDB }},
+			{name: "socket", path: func(c cli) string { return c.LitestreamSocket }},
+		} {
+			t.Run(target.name, func(t *testing.T) {
+				c := litestreamCLI(t)
+				c.LitestreamAWSRoleARN = "arn:aws:iam::123:role/test"
+				c.LitestreamAWSTokenFile = target.path(c)
+				assertValidateError(t, c, "must not equal")
+			})
+		}
+	})
 }
 
 func TestLitestreamStartupWithFakeProcess(t *testing.T) {

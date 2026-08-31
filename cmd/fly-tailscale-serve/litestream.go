@@ -54,6 +54,16 @@ func (c *cli) validateLitestream() error {
 		if !filepath.IsAbs(c.LitestreamAWSTokenFile) {
 			return errors.New("LITESTREAM_AWS_WEB_IDENTITY_TOKEN_FILE must be an absolute path")
 		}
+		tokenPath := filepath.Clean(c.LitestreamAWSTokenFile)
+		for name, path := range map[string]string{
+			"LITESTREAM_CONFIG": c.LitestreamConfig,
+			"LITESTREAM_DB":     c.LitestreamDB,
+			"LITESTREAM_SOCKET": c.LitestreamSocket,
+		} {
+			if tokenPath == filepath.Clean(path) {
+				return fmt.Errorf("LITESTREAM_AWS_WEB_IDENTITY_TOKEN_FILE must not equal %s", name)
+			}
+		}
 		if c.LitestreamAWSRefresh <= 0 {
 			return errors.New("LITESTREAM_AWS_OIDC_REFRESH_BEFORE must be greater than 0")
 		}

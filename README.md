@@ -159,7 +159,7 @@ Control-socket commands are used instead of log parsing. Litestream configuratio
 | `LITESTREAM_AWS_WEB_IDENTITY_TOKEN_FILE` | `/run/fly-tailscale-serve/aws-web-identity-token` | Private token file passed as `AWS_WEB_IDENTITY_TOKEN_FILE` |
 | `LITESTREAM_AWS_OIDC_REFRESH_BEFORE` | `2m` | Refresh margin before token expiry |
 
-Paths are explicit and must be absolute. The three main Litestream settings must be provided together. The YAML must enable the same control socket:
+Paths are explicit and must be absolute. The three main Litestream settings must be provided together. When AWS OIDC is enabled, its writable token path must be distinct from the config, database, and control socket paths. The YAML must enable the same control socket:
 
 ```yaml
 socket:
