@@ -13,7 +13,7 @@ Publish a localhost application running on a [Fly Machine](https://fly.io/docs/m
 5. Publishes the app as a named Tailscale service via `tsnet.ListenService`.
 6. Runs an in-process HTTPS reverse proxy that forwards traffic from the tailnet to your app.
 7. Runs a watchdog that exits the process after repeated Tailscale health failures, letting Fly restart the machine cleanly.
-8. Shuts down gracefully: drains the proxy, stops the app, and closes the tsnet server.
+8. Shuts down gracefully: withdraws the Tailscale service, drains the proxy, stops the app, and closes the tsnet server.
 
 ## Install
 
@@ -111,6 +111,7 @@ What to look for:
 | `TAILSCALE_HOSTNAME` | `FLY_APP_NAME` or `FLY_APP_NAME-FLY_MACHINE_ID` | Tailscale hostname for the node |
 | `TAILSCALE_STATE_DIR` | `/data/tailscale` | tsnet state directory |
 | `STARTUP_TIMEOUT` | `30s` | How long to wait for tsnet and the app to become healthy |
+| `SERVICE_DRAIN_DELAY` | `2s` | How long to keep serving after withdrawing the Tailscale service |
 | `SHUTDOWN_GRACE` | `3s` | How long to wait after stopping the proxy before stopping the app |
 | `WATCHDOG_INTERVAL` | `1m` | How often the watchdog checks Tailscale health |
 | `WATCHDOG_MAX_FAILURES` | `3` | Consecutive watchdog failures before the process exits |

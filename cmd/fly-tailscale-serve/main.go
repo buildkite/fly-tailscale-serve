@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,15 +24,17 @@ import (
 
 	"github.com/alecthomas/kong"
 	"tailscale.com/client/local"
+	"tailscale.com/ipn"
 	"tailscale.com/tsnet"
 )
 
 var version = "dev"
 
 const (
-	appHost            = "127.0.0.1"
-	flyAPISocket       = "/.fly/api"
-	processStopTimeout = 10 * time.Second
+	appHost             = "127.0.0.1"
+	flyAPISocket        = "/.fly/api"
+	processStopTimeout  = 10 * time.Second
+	serviceDrainTimeout = 5 * time.Second
 )
 
 type cli struct {
@@ -43,6 +46,7 @@ type cli struct {
 
 	// Runtime
 	StartupTimeout      time.Duration `env:"STARTUP_TIMEOUT" help:"How long to wait for tsnet and the application to become healthy." default:"30s" group:"Runtime"`
+	ServiceDrainDelay   time.Duration `env:"SERVICE_DRAIN_DELAY" help:"How long to keep serving after withdrawing the Tailscale service." default:"2s" group:"Runtime"`
 	ShutdownGrace       time.Duration `env:"SHUTDOWN_GRACE" help:"How long to wait after stopping the proxy before stopping the app." default:"3s" group:"Runtime"`
 	WatchdogInterval    time.Duration `env:"WATCHDOG_INTERVAL" help:"How often the watchdog should check Tailscale health." default:"1m" group:"Runtime"`
 	WatchdogMaxFailures int           `env:"WATCHDOG_MAX_FAILURES" help:"Consecutive watchdog failures before exiting." default:"3" group:"Runtime"`
@@ -229,6 +233,10 @@ func (c *cli) validate() error {
 
 	if c.StartupTimeout <= 0 {
 		return fmt.Errorf("STARTUP_TIMEOUT must be greater than 0")
+	}
+
+	if c.ServiceDrainDelay < 0 {
+		return fmt.Errorf("SERVICE_DRAIN_DELAY must not be negative")
 	}
 
 	if c.ShutdownGrace <= 0 {
@@ -573,7 +581,58 @@ func (s *service) tailscaleHealthy(ctx context.Context) error {
 	return nil
 }
 
+type prefsClient interface {
+	GetPrefs(context.Context) (*ipn.Prefs, error)
+	EditPrefs(context.Context, *ipn.MaskedPrefs) (*ipn.Prefs, error)
+}
+
+func withdrawService(ctx context.Context, client prefsClient, serviceName string) (bool, error) {
+	prefs, err := client.GetPrefs(ctx)
+	if err != nil {
+		return false, fmt.Errorf("get Tailscale prefs: %w", err)
+	}
+
+	services := slices.DeleteFunc(slices.Clone(prefs.AdvertiseServices), func(service string) bool {
+		return service == serviceName
+	})
+	if len(services) == len(prefs.AdvertiseServices) {
+		return false, nil
+	}
+
+	_, err = client.EditPrefs(ctx, &ipn.MaskedPrefs{
+		AdvertiseServicesSet: true,
+		Prefs:                ipn.Prefs{AdvertiseServices: services},
+	})
+	if err != nil {
+		return false, fmt.Errorf("edit Tailscale prefs: %w", err)
+	}
+
+	return true, nil
+}
+
+func (s *service) drainTailscaleService() {
+	if s.localClient == nil || s.listener == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), serviceDrainTimeout)
+	withdrawn, err := withdrawService(ctx, s.localClient, s.cli.ServiceName)
+	cancel()
+	if err != nil {
+		log.Printf("Tailscale service drain error: %v", err)
+		return
+	}
+	if !withdrawn {
+		return
+	}
+
+	log.Printf("Withdrew Tailscale service %s; waiting %s before stopping proxy...", s.cli.ServiceName, s.cli.ServiceDrainDelay)
+	time.Sleep(s.cli.ServiceDrainDelay)
+}
+
 func (s *service) shutdown() {
+	s.drainTailscaleService()
+
 	if s.proxyServer != nil {
 		log.Println("Shutting down proxy server...")
 		ctx, cancel := context.WithTimeout(context.Background(), s.cli.ShutdownGrace)

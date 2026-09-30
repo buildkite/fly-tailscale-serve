@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -8,6 +10,8 @@ import (
 	"net/url"
 	"testing"
 	"time"
+
+	"tailscale.com/ipn"
 )
 
 func validCLI() cli {
@@ -15,6 +19,7 @@ func validCLI() cli {
 		AppCommand:          "echo hello",
 		Port:                8080,
 		StartupTimeout:      30 * time.Second,
+		ServiceDrainDelay:   2 * time.Second,
 		ShutdownGrace:       3 * time.Second,
 		WatchdogInterval:    1 * time.Minute,
 		WatchdogMaxFailures: 3,
@@ -62,6 +67,12 @@ func TestValidate(t *testing.T) {
 		c := validCLI()
 		c.StartupTimeout = -1
 		assertValidateError(t, c, "STARTUP_TIMEOUT must be greater than 0")
+	})
+
+	t.Run("negative service drain delay", func(t *testing.T) {
+		c := validCLI()
+		c.ServiceDrainDelay = -1
+		assertValidateError(t, c, "SERVICE_DRAIN_DELAY must not be negative")
 	})
 
 	t.Run("negative shutdown grace", func(t *testing.T) {
@@ -285,6 +296,59 @@ func TestProxyPreservesForwardedHeaders(t *testing.T) {
 		proxy.ServeHTTP(rr, req)
 
 		assertEqual(t, rr.Header().Get("X-Got-Forwarded-For"), "")
+	})
+}
+
+type fakePrefsClient struct {
+	prefs   *ipn.Prefs
+	getErr  error
+	editErr error
+	edited  *ipn.MaskedPrefs
+}
+
+func (c *fakePrefsClient) GetPrefs(context.Context) (*ipn.Prefs, error) {
+	return c.prefs, c.getErr
+}
+
+func (c *fakePrefsClient) EditPrefs(_ context.Context, prefs *ipn.MaskedPrefs) (*ipn.Prefs, error) {
+	c.edited = prefs
+	return nil, c.editErr
+}
+
+func TestWithdrawService(t *testing.T) {
+	t.Run("removes only the configured service", func(t *testing.T) {
+		client := &fakePrefsClient{prefs: &ipn.Prefs{AdvertiseServices: []string{"svc:other", "svc:my-service"}}}
+
+		withdrawn, err := withdrawService(context.Background(), client, "svc:my-service")
+		assertNoError(t, err)
+		if !withdrawn {
+			t.Fatal("expected service to be withdrawn")
+		}
+		if client.edited == nil || !client.edited.AdvertiseServicesSet {
+			t.Fatal("expected AdvertiseServices to be edited")
+		}
+		assertSliceEqual(t, client.edited.AdvertiseServices, []string{"svc:other"})
+		assertSliceEqual(t, client.prefs.AdvertiseServices, []string{"svc:other", "svc:my-service"})
+	})
+
+	t.Run("does nothing when the service is not advertised", func(t *testing.T) {
+		client := &fakePrefsClient{prefs: &ipn.Prefs{AdvertiseServices: []string{"svc:other"}}}
+
+		withdrawn, err := withdrawService(context.Background(), client, "svc:my-service")
+		assertNoError(t, err)
+		if withdrawn || client.edited != nil {
+			t.Fatal("expected no prefs edit")
+		}
+	})
+
+	t.Run("returns prefs errors", func(t *testing.T) {
+		client := &fakePrefsClient{getErr: errors.New("boom")}
+
+		withdrawn, err := withdrawService(context.Background(), client, "svc:my-service")
+		if withdrawn {
+			t.Fatal("expected service not to be withdrawn")
+		}
+		assertErrorContains(t, err, "get Tailscale prefs: boom")
 	})
 }
 
