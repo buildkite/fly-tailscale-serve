@@ -110,6 +110,7 @@ What to look for:
 | `TAILSCALE_ACCEPT_APP_CAPS` | | Comma-separated app capabilities to forward via `Tailscale-App-Capabilities` header |
 | `TAILSCALE_HOSTNAME` | `FLY_APP_NAME` or `FLY_APP_NAME-FLY_MACHINE_ID` | Tailscale hostname for the node |
 | `TAILSCALE_STATE_DIR` | `/data/tailscale` | tsnet state directory |
+| `APP_HEALTH_PATH` | `/` | Path probed on the local app before the service is published. Any 2xx or 3xx response counts; redirects are not followed |
 | `STARTUP_TIMEOUT` | `30s` | How long to wait for tsnet and the app to become healthy |
 | `SHUTDOWN_GRACE` | `3s` | How long to wait after stopping the proxy before stopping the app |
 | `WATCHDOG_INTERVAL` | `1m` | How often the watchdog checks Tailscale health |
@@ -130,7 +131,7 @@ These env vars are set automatically on the app process and do not need to be co
 2. Start an embedded Tailscale node using `tsnet` with the federated identity client ID, the Fly token, the machine hostname, and the advertised tags.
 3. Wait for the tsnet server to reach Running state.
 4. Start the LocalAPI loopback listener via `tsnet.Loopback()`.
-5. Start the configured app command on `http://127.0.0.1:${PORT}` with `TS_LOCALAPI_ADDR` and `TS_LOCALAPI_CRED` env vars, and verify it responds.
+5. Start the configured app command on `http://127.0.0.1:${PORT}` with `TS_LOCALAPI_ADDR` and `TS_LOCALAPI_CRED` env vars, and verify `APP_HEALTH_PATH` responds with a 2xx or 3xx status.
 6. Listen on the named Tailscale service via `tsnet.ListenService` with HTTPS on port 443.
 7. Run an in-process reverse proxy forwarding requests to the local app.
 8. Run a watchdog so repeated Tailscale health failures stop the process and let Fly restart the machine cleanly.
