@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -14,6 +17,7 @@ func validCLI() cli {
 	return cli{
 		AppCommand:          "echo hello",
 		Port:                8080,
+		HealthPath:          "/",
 		StartupTimeout:      30 * time.Second,
 		ShutdownGrace:       3 * time.Second,
 		WatchdogInterval:    1 * time.Minute,
@@ -50,6 +54,12 @@ func TestValidate(t *testing.T) {
 		c := validCLI()
 		c.Port = 0
 		assertValidateError(t, c, "PORT must be between 1 and 65535")
+	})
+
+	t.Run("relative health path", func(t *testing.T) {
+		c := validCLI()
+		c.HealthPath = "api/health"
+		assertValidateError(t, c, "APP_HEALTH_PATH must start with \"/\"")
 	})
 
 	t.Run("port too high", func(t *testing.T) {
@@ -206,6 +216,59 @@ func TestNormalizeTags(t *testing.T) {
 func TestAppURL(t *testing.T) {
 	c := cli{Port: 3000}
 	assertEqual(t, c.appURL(), "http://127.0.0.1:3000")
+}
+
+func TestAppHealthURL(t *testing.T) {
+	c := cli{Port: 3000, HealthPath: "/api/health"}
+	assertEqual(t, c.appHealthURL(), "http://127.0.0.1:3000/api/health")
+}
+
+func TestWaitForAppHealth(t *testing.T) {
+	newApp := func(t *testing.T, handler http.HandlerFunc) *service {
+		t.Helper()
+		app := httptest.NewServer(handler)
+		t.Cleanup(app.Close)
+		port, err := strconv.Atoi(app.URL[strings.LastIndex(app.URL, ":")+1:])
+		if err != nil {
+			t.Fatalf("parse test server port: %v", err)
+		}
+		c := validCLI()
+		c.Port = port
+		c.HealthPath = "/api/health"
+		c.StartupTimeout = 3 * time.Second
+		return newService(&c)
+	}
+
+	t.Run("probes the configured path", func(t *testing.T) {
+		s := newApp(t, func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/api/health" {
+				w.WriteHeader(http.StatusNotFound)
+			}
+		})
+		if err := s.waitForAppHealth(context.Background(), nil); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("treats a redirect as reachable without following it", func(t *testing.T) {
+		s := newApp(t, func(w http.ResponseWriter, r *http.Request) {
+			// Unroutable: following this would fail the probe.
+			http.Redirect(w, r, "https://192.0.2.1/login", http.StatusFound)
+		})
+		if err := s.waitForAppHealth(context.Background(), nil); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("fails on server errors", func(t *testing.T) {
+		s := newApp(t, func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		})
+		s.cli.StartupTimeout = 1500 * time.Millisecond
+		if err := s.waitForAppHealth(context.Background(), nil); err == nil {
+			t.Fatal("expected an error")
+		}
+	})
 }
 
 func TestAppCommandArgs(t *testing.T) {

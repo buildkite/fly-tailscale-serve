@@ -40,6 +40,7 @@ type cli struct {
 	// App
 	AppCommand string `env:"APP_COMMAND" help:"Space-separated command used to start the local application process." required:"" group:"App"`
 	Port       int    `env:"PORT" help:"Local application port on 127.0.0.1." required:"" group:"App"`
+	HealthPath string `env:"APP_HEALTH_PATH" help:"Path probed on the local application before publishing the service." default:"/" group:"App"`
 
 	// Runtime
 	StartupTimeout      time.Duration `env:"STARTUP_TIMEOUT" help:"How long to wait for tsnet and the application to become healthy." default:"30s" group:"Runtime"`
@@ -212,7 +213,14 @@ func newService(cli *cli) *service {
 			Transport: flyTransport,
 			Timeout:   10 * time.Second,
 		},
-		appHTTPClient: &http.Client{Timeout: 2 * time.Second},
+		appHTTPClient: &http.Client{
+			Timeout: 2 * time.Second,
+			// A redirect proves the app is serving. Following it can leave the
+			// machine (SSO) or target the tailnet origin before it is published.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}
 }
 
@@ -225,6 +233,10 @@ func (c *cli) validate() error {
 
 	if c.Port < 1 || c.Port > 65535 {
 		return fmt.Errorf("PORT must be between 1 and 65535")
+	}
+
+	if !strings.HasPrefix(c.HealthPath, "/") {
+		return errors.New("APP_HEALTH_PATH must start with \"/\"")
 	}
 
 	if c.StartupTimeout <= 0 {
@@ -263,6 +275,10 @@ func (c *cli) validate() error {
 
 func (c *cli) appURL() string {
 	return fmt.Sprintf("http://%s:%d", appHost, c.Port)
+}
+
+func (c *cli) appHealthURL() string {
+	return c.appURL() + c.HealthPath
 }
 
 func (c *cli) appCommandArgs() []string {
@@ -430,7 +446,7 @@ func (s *service) waitForAppHealth(ctx context.Context, appDone <-chan error) er
 	attempt := 1
 
 	for !time.Now().After(deadline) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.cli.appURL(), nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.cli.appHealthURL(), nil)
 		if err != nil {
 			return fmt.Errorf("build app health request: %w", err)
 		}
@@ -449,17 +465,17 @@ func (s *service) waitForAppHealth(ctx context.Context, appDone <-chan error) er
 		select {
 		case err := <-appDone:
 			if err == nil {
-				return fmt.Errorf("app process exited before becoming reachable at %s", s.cli.appURL())
+				return fmt.Errorf("app process exited before becoming reachable at %s", s.cli.appHealthURL())
 			}
 
-			return fmt.Errorf("app process exited before becoming reachable at %s: %w", s.cli.appURL(), err)
+			return fmt.Errorf("app process exited before becoming reachable at %s: %w", s.cli.appHealthURL(), err)
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(time.Second):
 		}
 	}
 
-	return fmt.Errorf("app did not become reachable at %s", s.cli.appURL())
+	return fmt.Errorf("app did not become reachable at %s", s.cli.appHealthURL())
 }
 
 func (s *service) startProxy(ctx context.Context) error {
