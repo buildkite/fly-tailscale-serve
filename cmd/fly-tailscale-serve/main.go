@@ -38,8 +38,9 @@ type cli struct {
 	Version kong.VersionFlag `help:"Print version and exit."`
 
 	// App
-	AppCommand string `env:"APP_COMMAND" help:"Space-separated command used to start the local application process." required:"" group:"App"`
-	Port       int    `env:"PORT" help:"Local application port on 127.0.0.1." required:"" group:"App"`
+	AppCommand    string `env:"APP_COMMAND" help:"Space-separated command used to start the local application process." required:"" group:"App"`
+	Port          int    `env:"PORT" help:"Local application port on 127.0.0.1." required:"" group:"App"`
+	AppHealthPath string `env:"APP_HEALTH_PATH" help:"Local application path to probe before publishing the service." default:"/" group:"App"`
 
 	// Runtime
 	StartupTimeout      time.Duration `env:"STARTUP_TIMEOUT" help:"How long to wait for tsnet and the application to become healthy." default:"30s" group:"Runtime"`
@@ -225,6 +226,10 @@ func (c *cli) validate() error {
 
 	if c.Port < 1 || c.Port > 65535 {
 		return fmt.Errorf("PORT must be between 1 and 65535")
+	}
+
+	if !strings.HasPrefix(c.AppHealthPath, "/") {
+		return errors.New("APP_HEALTH_PATH must start with /")
 	}
 
 	if c.StartupTimeout <= 0 {
@@ -426,11 +431,12 @@ func (s *service) startApp() error {
 }
 
 func (s *service) waitForAppHealth(ctx context.Context, appDone <-chan error) error {
+	healthURL := s.cli.appURL() + s.cli.AppHealthPath
 	deadline := time.Now().Add(s.cli.StartupTimeout)
 	attempt := 1
 
 	for !time.Now().After(deadline) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.cli.appURL(), nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
 		if err != nil {
 			return fmt.Errorf("build app health request: %w", err)
 		}
@@ -449,17 +455,17 @@ func (s *service) waitForAppHealth(ctx context.Context, appDone <-chan error) er
 		select {
 		case err := <-appDone:
 			if err == nil {
-				return fmt.Errorf("app process exited before becoming reachable at %s", s.cli.appURL())
+				return fmt.Errorf("app process exited before becoming reachable at %s", healthURL)
 			}
 
-			return fmt.Errorf("app process exited before becoming reachable at %s: %w", s.cli.appURL(), err)
+			return fmt.Errorf("app process exited before becoming reachable at %s: %w", healthURL, err)
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(time.Second):
 		}
 	}
 
-	return fmt.Errorf("app did not become reachable at %s", s.cli.appURL())
+	return fmt.Errorf("app did not become reachable at %s", healthURL)
 }
 
 func (s *service) startProxy(ctx context.Context) error {

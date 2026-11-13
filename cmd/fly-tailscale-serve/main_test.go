@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -13,6 +15,7 @@ import (
 func validCLI() cli {
 	return cli{
 		AppCommand:          "echo hello",
+		AppHealthPath:       "/",
 		Port:                8080,
 		StartupTimeout:      30 * time.Second,
 		ShutdownGrace:       3 * time.Second,
@@ -56,6 +59,12 @@ func TestValidate(t *testing.T) {
 		c := validCLI()
 		c.Port = 65536
 		assertValidateError(t, c, "PORT must be between 1 and 65535")
+	})
+
+	t.Run("relative health path", func(t *testing.T) {
+		c := validCLI()
+		c.AppHealthPath = "api/health"
+		assertValidateError(t, c, "APP_HEALTH_PATH must start with /")
 	})
 
 	t.Run("negative startup timeout", func(t *testing.T) {
@@ -201,6 +210,32 @@ func TestNormalizeTags(t *testing.T) {
 			t.Errorf("got %v, want empty", got)
 		}
 	})
+}
+
+func TestWaitForAppHealth(t *testing.T) {
+	for _, path := range []string{"/", "/api/health"} {
+		t.Run(path, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != path {
+					http.Redirect(w, r, "http://127.0.0.1:1/login", http.StatusFound)
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
+
+			c := validCLI()
+			c.Port = server.Listener.Addr().(*net.TCPAddr).Port
+			c.AppHealthPath = path
+			c.StartupTimeout = time.Second
+			svc := newService(&c)
+
+			if err := svc.waitForAppHealth(context.Background(), make(chan error)); err != nil {
+				t.Fatalf("startup health check failed: %v", err)
+			}
+			assertEqual(t, c.appURL(), server.URL)
+		})
+	}
 }
 
 func TestAppURL(t *testing.T) {
