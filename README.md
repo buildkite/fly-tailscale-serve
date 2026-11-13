@@ -107,6 +107,7 @@ What to look for:
 
 | Variable | Default | Description |
 |---|---|---|
+| `APP_HEALTH_PATH` | `/` | Local application path to probe before publishing the service (e.g. `/api/health`); must start with `/` |
 | `TAILSCALE_ACCEPT_APP_CAPS` | | Comma-separated app capabilities to forward via `Tailscale-App-Capabilities` header |
 | `TAILSCALE_HOSTNAME` | `FLY_APP_NAME` or `FLY_APP_NAME-FLY_MACHINE_ID` | Tailscale hostname for the node |
 | `TAILSCALE_STATE_DIR` | `/data/tailscale` | tsnet state directory |
@@ -114,6 +115,8 @@ What to look for:
 | `SHUTDOWN_GRACE` | `3s` | How long to wait after stopping the proxy before stopping the app |
 | `WATCHDOG_INTERVAL` | `1m` | How often the watchdog checks Tailscale health |
 | `WATCHDOG_MAX_FAILURES` | `3` | Consecutive watchdog failures before the process exits |
+
+The startup probe requests `http://127.0.0.1:$PORT$APP_HEALTH_PATH` before the Tailscale service starts. For apps whose root redirects to sign-in, set `APP_HEALTH_PATH=/api/health` (or your app's unauthenticated health endpoint) so startup does not depend on the sign-in service. This does not change the reverse proxy target or watchdog checks.
 
 ### Injected into the app process
 
